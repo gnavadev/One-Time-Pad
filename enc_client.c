@@ -1,6 +1,5 @@
 #include <stdarg.h>
 #include <stdio.h>
-#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -8,203 +7,163 @@
 #include <sys/socket.h>
 #include <netdb.h>
 
-#define BUFFER_SIZE 1000
+#define MAX_BUFFER 1000
 
-void error(const char *format, ...)
+void report_error(const char *msg, ...)
 {
     va_list args;
-    va_start(args, format);
-    fprintf(stderr, "Client error: ");
-    vfprintf(stderr, format, args);
+    va_start(args, msg);
+    fprintf(stderr, "Error in Encryption Client: ");
+    vfprintf(stderr, msg, args);
     fprintf(stderr, "\n");
     va_end(args);
     exit(1);
 }
 
-void setupAddressStruct(struct sockaddr_in *address, int portNumber, char *hostname)
+void initializeSocketAddress(struct sockaddr_in *addr, int port, char *host)
 {
-    if (!address || !hostname)
-    {
-        error("Invalid input to setupAddressStruct");
-        return;
-    }
+    if (!addr || !host)
+        report_error("Invalid parameters for initializeSocketAddress");
 
-    struct addrinfo hints, *res;
+    struct addrinfo hints, *result;
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET; // IPv4
+    hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
 
-    char portStr[6]; // Enough to store max port number 65535 and null terminator
-    snprintf(portStr, sizeof(portStr), "%d", portNumber);
+    char portString[6];
+    snprintf(portString, sizeof(portString), "%d", port);
 
-    if (getaddrinfo(hostname, portStr, &hints, &res) != 0)
-    {
-        error("Failed to get host info");
-        return;
-    }
+    if (getaddrinfo(host, portString, &hints, &result) != 0)
+        report_error("Could not obtain address info");
 
-    if (res->ai_family == AF_INET)
-    { // Sanity check
-        memcpy(address, res->ai_addr, sizeof(struct sockaddr_in));
-    }
+    if (result->ai_family == AF_INET)
+        memcpy(addr, result->ai_addr, sizeof(struct sockaddr_in));
     else
-    {
-        error("Host found but not IPv4");
-    }
+        report_error("Non-IPv4 address encountered");
 
-    freeaddrinfo(res); // Free the linked list allocated by getaddrinfo
+    freeaddrinfo(result);
 }
 
-void sendData(int sock, const char *data)
+void transmitData(int socket_fd, const char *data)
 {
-    int len = strlen(data);
-    if (send(sock, &len, sizeof(len), 0) < 0)
-        error("Unable to write to socket");
-    if (send(sock, data, len, 0) < 0)
-        error("Unable to write to socket");
+    int length = strlen(data);
+    if (send(socket_fd, &length, sizeof(length), 0) < 0)
+        report_error("Failed to send data length");
+    if (send(socket_fd, data, length, 0) < 0)
+        report_error("Failed to send data");
 }
 
-char *receive(int sock)
+char *receiveData(int socket_fd)
 {
-    // Get length of data
-    int len;
-    if (recv(sock, &len, sizeof(len), 0) < 0)
-    {
-        error(1, "Unable to read from socket");
-    }
+    int data_length;
+    if (recv(socket_fd, &data_length, sizeof(data_length), 0) < 0)
+        report_error("Failed to receive data length");
 
-    // Allocate memory for the result
-    char *result = malloc(len + 1);
-    if (!result)
-    {
-        error(1, "Unable to allocate memory");
-    }
-
-    // Receive data in chunks based on BUFFER_SIZE
-    int totalReceived = 0, charsRead;
-    while (totalReceived < len)
-    {
-        int chunkSize = len - totalReceived > BUFFER_SIZE ? BUFFER_SIZE : len - totalReceived;
-        charsRead = recv(sock, result + totalReceived, chunkSize, 0);
-        if (charsRead < 0)
-        {
-            free(result);
-            error(1, "Unable to read from socket");
-        }
-        totalReceived += charsRead;
-    }
-
-    // Null-terminate the received string
-    result[len] = '\0';
-    return result;
-}
-
-void validate(int sock)
-{
-    char clientMsg[4] = "enc", serverMsg[4] = {0};
-
-    if (send(sock, clientMsg, sizeof(clientMsg), 0) < 0)
-    {
-        error("Unable to write to socket");
-        return;
-    }
-
-    int totalReceived = 0;
-    while (totalReceived < sizeof(serverMsg))
-    {
-        int received = recv(sock, serverMsg + totalReceived, sizeof(serverMsg) - totalReceived, 0);
-        if (received < 0)
-        {
-            error("Unable to read from socket");
-            return;
-        }
-        else if (received == 0)
-        {
-            error("Connection closed by server");
-            return;
-        }
-        totalReceived += received;
-    }
-
-    if (strncmp(clientMsg, serverMsg, sizeof(clientMsg)) != 0)
-    {
-        close(sock);
-        error("Server validation failed");
-    }
-}
-
-char *stringFromFile(char *path)
-{
-    // Open file at path
-    FILE *file = fopen(path, "r");
-    if (!file)
-        error(0, "Unable to open file: %s", path);
-
-    // Seek file to get sieze (len)
-    fseek(file, 0, SEEK_END);
-    size_t len = ftell(file) - 1;
-    fseek(file, 0, SEEK_SET);
-
-    // Create buffer, error of unable
-    char *buffer = (char *)malloc(len + 1);
+    char *buffer = malloc(data_length + 1);
     if (!buffer)
+        report_error("Memory allocation failed");
+
+    int received = 0, bytes;
+    while (received < data_length)
     {
-        fclose(file);
-        error(0, "Unable to allocate memory");
+        int to_read = data_length - received > MAX_BUFFER ? MAX_BUFFER : data_length - received;
+        bytes = recv(socket_fd, buffer + received, to_read, 0);
+        if (bytes < 0)
+            report_error("Failed to receive data");
+        received += bytes;
     }
 
-    // Copy file contents to buffer
-    for (int i = 0; i < len; i++)
-    {
-        char c = fgetc(file);
-        // Error if invalid char found
-        if ((c < 'A' || c > 'Z') && c != ' ')
-        {
-            free(buffer);
-            fclose(file);
-            error(0, "Invalid character found in file %s: %c, %d", path, c, c);
-        }
-        buffer[i] = c;
-    }
-    buffer[len] = '\0';
-
-    // Close file & return string
-    fclose(file);
+    buffer[data_length] = '\0';
     return buffer;
+}
+
+void performValidation(int sock_fd)
+{
+    char msgFromClient[4] = "enc", msgFromServer[4] = {0};
+
+    if (send(sock_fd, msgFromClient, sizeof(msgFromClient), 0) < 0)
+        report_error("Error sending validation message");
+
+    int receivedBytes = 0;
+    while (receivedBytes < sizeof(msgFromServer))
+    {
+        int bytes = recv(sock_fd, msgFromServer + receivedBytes, sizeof(msgFromServer) - receivedBytes, 0);
+        if (bytes < 0)
+            report_error("Error receiving validation response");
+        else if (bytes == 0)
+            report_error("Server closed connection unexpectedly");
+        receivedBytes += bytes;
+    }
+
+    if (strncmp(msgFromClient, msgFromServer, sizeof(msgFromClient)) != 0)
+    {
+        close(sock_fd);
+        report_error("Validation with server failed");
+    }
+}
+
+char *readStringFromFile(char *filePath)
+{
+    FILE *filePtr = fopen(filePath, "r");
+    if (!filePtr)
+        report_error("Failed to open file: %s", filePath);
+
+    fseek(filePtr, 0, SEEK_END);
+    size_t fileLen = ftell(filePtr) - 1;
+    fseek(filePtr, 0, SEEK_SET);
+
+    char *fileContent = (char *)malloc(fileLen + 1);
+    if (!fileContent)
+    {
+        fclose(filePtr);
+        report_error("Memory allocation failed for file content");
+    }
+
+    for (int i = 0; i < fileLen; i++)
+    {
+        char ch = fgetc(filePtr);
+        if ((ch < 'A' || ch > 'Z') && ch != ' ')
+        {
+            free(fileContent);
+            fclose(filePtr);
+            report_error("File contains invalid character: %s, %c", filePath, ch);
+        }
+        fileContent[i] = ch;
+    }
+    fileContent[fileLen] = '\0';
+
+    fclose(filePtr);
+    return fileContent;
 }
 
 int main(int argc, char *argv[])
 {
-    // Check usage & args
     if (argc < 4)
-        error(0, "USAGE: %s port\n", argv[0]);
+        report_error("Usage: %s <text file> <key file> <port>", argv[0]);
 
-    // Init and validate text/key
-    char *text = stringFromFile(argv[1]);
-    char *key = stringFromFile(argv[2]);
+    char *text = readStringFromFile(argv[1]);
+    char *key = readStringFromFile(argv[2]);
+
     if (strlen(text) > strlen(key))
-        error(0, "Key shorter than text");
+        report_error("The key is shorter than the text");
 
-    // Create the socket that will listen for connections
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0)
-        error(0, "Unable to open socket");
+        report_error("Failed to create socket");
 
-    // Set up the address struct for the server socket
-    struct sockaddr_in server;
-    setupAddressStruct(&server, atoi(argv[3]), "localhost");
+    struct sockaddr_in serverAddress;
+    initializeSocketAddress(&serverAddress, atoi(argv[3]), "localhost");
 
-    // Connect to server
-    if (connect(sock, (struct sockaddr *)&server, sizeof(server)) < 0)
-        error(0, "Unable to connect to server");
+    if (connect(sock, (struct sockaddr *)&serverAddress, sizeof(serverAddress)) < 0)
+        report_error("Failed to connect to the server");
 
-    // Validate connection, send data & print encrypted text
-    validate(sock);
-    sendData(sock, text);
-    sendData(sock, key);
-    printf("%s\n", receive(sock));
+    performValidation(sock);
+    transmitData(sock, text);
+    transmitData(sock, key);
+    char *received = receiveData(sock);
+    printf("%s\n", received);
 
-    // Close the listening socket
+    free(received); // Free the received data after printing
     close(sock);
     return 0;
 }

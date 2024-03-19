@@ -6,243 +6,171 @@
 #include <netinet/in.h>
 #include <signal.h>
 
-#define BUFFER_SIZE 1000
+#define MAX_BUFFER 1000
 
-int error(int exitCode, const char *format, ...)
+int handle_error(int statusCode, const char *msg, ...)
 {
-	// Retrieve additional arguments
-	va_list args;
-	va_start(args, format);
-
-	// Print error to stderr
-	fprintf(stderr, "Client error: ");
-	vfprintf(stderr, format, args);
-	fprintf(stderr, "\n");
-
-	// End var arg list & exit
-	va_end(args);
-	exit(exitCode);
+    va_list argp;
+    va_start(argp, msg);
+    fprintf(stderr, "Error detected: ");
+    vfprintf(stderr, msg, argp);
+    fprintf(stderr, "\n");
+    va_end(argp);
+    exit(statusCode);
 }
 
-void setupAddressStruct(struct sockaddr_in *address, int portNumber)
+void init_sockaddr(struct sockaddr_in *addr, int port)
 {
-	// Clear out the address struct
-	memset((char *)address, '\0', sizeof(*address));
-
-	// The address should be network capable
-	address->sin_family = AF_INET;
-
-	// Store the port number
-	address->sin_port = htons(portNumber);
-
-	// Allow a client at any address to connect to this server
-	address->sin_addr.s_addr = INADDR_ANY;
+    memset((char *)addr, 0, sizeof(*addr));
+    addr->sin_family = AF_INET;
+    addr->sin_port = htons(port);
+    addr->sin_addr.s_addr = INADDR_ANY;
 }
 
-void sendData(int sock, char *data)
+void send_message(int connection, char *message)
 {
-    // Get length of data
-    int len = (int)strlen(data);
-    int totalSent = 0;
+    int message_len = strlen(message), sent_bytes = 0;
+    if (send(connection, &message_len, sizeof(message_len), 0) < 0)
+        handle_error(1, "Error sending on socket");
 
-    // Send the length of the data
-    if (send(sock, &len, sizeof(len), 0) < 0)
-        error(1, "Unable to write to socket");
-
-    // Loop over send() for the data
-    while (totalSent < len)
+    while (sent_bytes < message_len)
     {
-        // Determine the number of characters to send in this iteration
-        int charsToSend = len - totalSent;
-        if (charsToSend > BUFFER_SIZE)
-            charsToSend = BUFFER_SIZE;
-
-        // Send data
-        int charsSent = send(sock, data + totalSent, charsToSend, 0);
-        if (charsSent < 0)
-            error(1, "Unable to write to socket");
-
-        // Update total sent
-        totalSent += charsSent;
+        int bytes_to_send = message_len - sent_bytes > MAX_BUFFER ? MAX_BUFFER : message_len - sent_bytes;
+        int sent = send(connection, message + sent_bytes, bytes_to_send, 0);
+        if (sent < 0)
+            handle_error(1, "Error sending on socket");
+        sent_bytes += sent;
     }
 }
 
-char *receive(int sock)
+char *receive_message(int connection)
 {
-	// Get length of data
-	int len;
-	if (recv(sock, &len, sizeof(len), 0) < 0)
-	{
-		error(1, "Unable to read from socket");
-	}
+    int message_len;
+    if (recv(connection, &message_len, sizeof(message_len), 0) < 0)
+        handle_error(1, "Error reading from socket");
 
-	// Allocate memory for the result
-	char *result = malloc(len + 1);
-	if (!result)
-	{
-		error(1, "Unable to allocate memory");
-	}
+    char *buffer = malloc(message_len + 1);
+    if (!buffer)
+        handle_error(1, "Memory allocation failed");
 
-	// Receive data in chunks based on BUFFER_SIZE
-	int totalReceived = 0, charsRead;
-	while (totalReceived < len)
-	{
-		int chunkSize = len - totalReceived > BUFFER_SIZE ? BUFFER_SIZE : len - totalReceived;
-		charsRead = recv(sock, result + totalReceived, chunkSize, 0);
-		if (charsRead < 0)
-		{
-			free(result);
-			error(1, "Unable to read from socket");
-		}
-		totalReceived += charsRead;
-	}
-
-	// Null-terminate the received string
-	result[len] = '\0';
-	return result;
+    int received = 0;
+    while (received < message_len)
+    {
+        int bytes = recv(connection, buffer + received, message_len - received, 0);
+        if (bytes < 0)
+        {
+            free(buffer);
+            handle_error(1, "Error reading from socket");
+        }
+        received += bytes;
+    }
+    buffer[message_len] = '\0';
+    return buffer;
 }
 
-void validate(int sock)
+void authenticate_client(int connection)
 {
-	char clientMsg[4] = "enc", serverMsg[4] = {0};
+    char server_signal[4] = "enc", client_signal[4] = {0};
+    if (send(connection, server_signal, sizeof(server_signal), 0) < 0)
+        handle_error(1, "Error sending on socket");
 
-	if (send(sock, clientMsg, sizeof(clientMsg), 0) < 0)
-	{
-		error(1, "Unable to write to socket");
-		return;
-	}
+    int received_bytes = 0;
+    while (received_bytes < sizeof(client_signal))
+    {
+        int bytes = recv(connection, client_signal + received_bytes, sizeof(client_signal) - received_bytes, 0);
+        if (bytes < 0)
+            handle_error(1, "Error reading from socket");
+        received_bytes += bytes;
+    }
 
-	int totalReceived = 0;
-	while (totalReceived < sizeof(serverMsg))
-	{
-		int received = recv(sock, serverMsg + totalReceived, sizeof(serverMsg) - totalReceived, 0);
-		if (received < 0)
-		{
-			error(1, "Unable to read from socket");
-			return;
-		}
-		else if (received == 0)
-		{
-			error(2, "Connection closed by server");
-			return;
-		}
-		totalReceived += received;
-	}
-
-	if (strncmp(clientMsg, serverMsg, sizeof(clientMsg)) != 0)
-	{
-		close(sock);
-		error(2, "Client not enc_client");
-	}
+    if (strncmp(server_signal, client_signal, sizeof(server_signal)) != 0)
+    {
+        close(connection);
+        handle_error(2, "Authentication failed");
+    }
 }
 
-void handleOtpComm(int sock)
+void process_encryption(int connection)
 {
-	// Receive text and key
-	char *text = receive(sock);
-	char *key = receive(sock);
+    char *text = receive_message(connection);
+    char *key = receive_message(connection);
+    int text_length = strlen(text);
 
-	// Determine the length of the text to avoid multiple strlen calls
-	int len = strlen(text);
+    char *encrypted_text = malloc(text_length + 1);
+    if (!encrypted_text)
+    {
+        free(text);
+        free(key);
+        close(connection);
+        return;
+    }
 
-	// Allocate memory for result based on the text length
-	char *result = (char *)malloc(len + 1);
-	if (result == NULL)
-	{
-		// Handle memory allocation failure
-		free(text);
-		free(key);
-		close(sock);
-		return;
-	}
+    for (int i = 0; i < text_length; ++i)
+    {
+        int text_char = (text[i] == ' ') ? 26 : text[i] - 'A';
+        int key_char = (key[i] == ' ') ? 26 : key[i] - 'A';
+        int encrypted_char = (text_char + key_char) % 27;
+        encrypted_text[i] = (encrypted_char == 26) ? ' ' : encrypted_char + 'A';
+    }
+    encrypted_text[text_length] = '\0';
 
-	// Pre-calculate the value for space
-	int spaceVal = 26; // 26 represents the space
-
-	// Perform encryption
-	for (int i = 0; i < len; i++)
-	{
-		int txtVal = (text[i] == ' ') ? spaceVal : text[i] - 'A';
-		int keyVal = (key[i] == ' ') ? spaceVal : key[i] - 'A';
-		int encVal = (txtVal + keyVal) % 27;
-		result[i] = (encVal == spaceVal) ? ' ' : encVal + 'A';
-	}
-	result[len] = '\0';
-
-	// Send the encrypted text back, free the allocated memory, and close the socket
-	sendData(sock, result);
-	free(result);
-	free(text);
-	free(key);
-	close(sock);
+    send_message(connection, encrypted_text);
+    free(encrypted_text);
+    free(text);
+    free(key);
+    close(connection);
 }
 
-volatile sig_atomic_t keep_running = 1;
+volatile sig_atomic_t server_active = 1;
 
-void sigint_handler(int signum)
+void stop_server(int signal)
 {
-	keep_running = 0;
+    server_active = 0;
 }
 
-int main(int argc, const char *argv[])
+int main(int argc, char *argv[])
 {
-	// Register SIGINT handler
-	signal(SIGINT, sigint_handler);
+    signal(SIGINT, stop_server);
+    if (argc < 2)
+        handle_error(1, "Usage: %s port_number\n", argv[0]);
 
-	// Check usage & args
-	if (argc < 2)
-		error(1, "USAGE: %s port\n", argv[0]);
+    int listen_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_socket < 0)
+        handle_error(1, "Error opening socket");
 
-	// Create the socket that will listen for connections
-	int listenSock = socket(AF_INET, SOCK_STREAM, 0);
-	if (listenSock < 0)
-		error(1, "Unable to open socket");
+    int option_value = 1;
+    if (setsockopt(listen_socket, SOL_SOCKET, SO_REUSEADDR, &option_value, sizeof(option_value)) < 0)
+        handle_error(1, "Error setting socket options");
 
-	// Set socket option to allow address reuse
-	int optval = 1;
-	if (setsockopt(listenSock, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0)
-		error(1, "Unable to set socket options");
+    struct sockaddr_in server_addr, client_addr;
+    socklen_t client_addr_size = sizeof(client_addr);
+    init_sockaddr(&server_addr, atoi(argv[1]));
 
-	// Set up the address struct for the server socket
-	struct sockaddr_in server, client;
-	socklen_t clientSize = sizeof(client);
-	setupAddressStruct(&server, atoi(argv[1]));
+    if (bind(listen_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0)
+        handle_error(1, "Error binding socket");
 
-	// Associate the socket to the port
-	if (bind(listenSock, (struct sockaddr *)&server, sizeof(server)) < 0)
-		error(1, "Unable to bind socket");
+    listen(listen_socket, 5);
 
-	// Start listening for connections. Allow up to 5 connections to queue up
-	listen(listenSock, 5);
-
-	// Main loop
-	while (keep_running)
+	while (server_active)
 	{
-		// Accept the connection request which creates a connection socket
-		int sock = accept(listenSock, (struct sockaddr *)&client, &clientSize);
-		if (sock < 0)
-			error(1, "Unable to accept connection");
+		int connection_fd = accept(listen_socket, (struct sockaddr *)&client_addr, &client_addr_size);
+		if (connection_fd < 0)
+			handle_error(1, "Error accepting connection");
 
-		// Fork children to handle client connections
 		int pid = fork();
-		switch (pid)
+		if (pid < 0)
+			handle_error(1, "Error forking process");
+		else if (pid == 0)
 		{
-		case -1:
-			// Fork error
-			error(1, "Unable to fork child");
-			break;
-		case 0:
-			// Child case
-			validate(sock);
-			handleOtpComm(sock);
+			authenticate_client(connection_fd);
+			process_encryption(connection_fd);  // Corrected function name here
 			exit(0);
-		default:
-			// Parent case
-			close(sock);
 		}
+		else
+			close(connection_fd);
 	}
 
-	// Close the listening socket
-	close(listenSock);
-	return 0;
+
+    close(listen_socket);
+    return 0;
 }
